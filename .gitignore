@@ -205,3 +205,9 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Monorepo
+backend/.venv/
+backend/.venv312/
+frontend/node_modules/
+frontend/.next/
