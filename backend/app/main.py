@@ -4,16 +4,16 @@ import csv
 import io
 import logging
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 from urllib.parse import quote
 from uuid import UUID
 
-from fastapi import Depends, FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, EmailStr, Field
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -21,15 +21,18 @@ from sqlalchemy.orm import selectinload
 import app.models  # noqa: F401  # register SQLAlchemy mappers for Alembic / metadata
 
 from app.core.config import get_settings
-from app.db.session import get_async_session
+from app.core.security import create_access_token, decode_access_token, hash_password, verify_password
+from app.db.session import async_session_factory, get_async_session
+from app.deps.auth import get_current_user
 from app.models.draft import DraftQueueEntry
-from app.models.enums import NFLTeam, PlayerPosition, TradeStatus
-from app.models.league import League
+from app.models.enums import LeagueRole, NFLTeam, PlayerPosition, TradeStatus
+from app.models.league import League, LeagueMember
 from app.models.player import Player
 from app.models.roster import RosterEntry
 from app.models.team import Team
 from app.models.trade import Trade
 from app.models.user import User
+from app.services.league_access import user_has_league_access, user_is_league_commissioner
 from app.websocket.manager import draft_channel, get_broker, trade_feed_channel
 
 logger = logging.getLogger(__name__)
@@ -137,6 +140,7 @@ class LeagueRead(BaseModel):
     id: UUID
     name: str
     slug: str
+    draft_scheduled_at: datetime | None = None
 
 
 class DraftSessionResponse(BaseModel):
@@ -206,14 +210,137 @@ class CommissionerTradeApprovalResponse(BaseModel):
     executed_at: datetime | None
 
 
+class RegisterRequest(BaseModel):
+    email: EmailStr
+    password: str = Field(min_length=8, max_length=128)
+    display_name: str | None = Field(default=None, max_length=120)
+
+
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+
+
+class UserRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    email: str
+    display_name: str | None
+
+
+class MyLeagueRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    name: str
+    slug: str
+    draft_scheduled_at: datetime | None
+    is_commissioner: bool
+
+
+class ScheduleDraftRequest(BaseModel):
+    draft_scheduled_at: datetime
+
+
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.post("/api/auth/register", response_model=TokenResponse)
+async def auth_register(
+    payload: RegisterRequest,
+    session: AsyncSession = Depends(get_async_session),
+) -> TokenResponse:
+    email = str(payload.email).strip().lower()
+    existing = await session.scalar(select(User).where(User.email == email))
+    if existing is not None:
+        raise HTTPException(status_code=409, detail="Email already registered")
+    display = payload.display_name.strip() if payload.display_name else None
+    user = User(
+        email=email,
+        display_name=display,
+        password_hash=hash_password(payload.password),
+    )
+    session.add(user)
+    await session.commit()
+    await session.refresh(user)
+    return TokenResponse(access_token=create_access_token(subject=user.id))
+
+
+@app.post("/api/auth/login", response_model=TokenResponse)
+async def auth_login(
+    payload: LoginRequest,
+    session: AsyncSession = Depends(get_async_session),
+) -> TokenResponse:
+    email = str(payload.email).strip().lower()
+    user = await session.scalar(select(User).where(User.email == email))
+    if user is None or not user.password_hash or not verify_password(payload.password, user.password_hash):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    return TokenResponse(access_token=create_access_token(subject=user.id))
+
+
+@app.get("/api/auth/me", response_model=UserRead)
+async def auth_me(current_user: User = Depends(get_current_user)) -> UserRead:
+    return UserRead.model_validate(current_user)
+
+
+@app.get("/api/me/leagues", response_model=list[MyLeagueRead])
+async def list_my_leagues(
+    current_user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_async_session),
+) -> list[MyLeagueRead]:
+    member_league_ids = list(
+        (await session.scalars(select(LeagueMember.league_id).where(LeagueMember.user_id == current_user.id))).all()
+    )
+    team_league_ids = list(
+        (
+            await session.scalars(
+                select(Team.league_id).where(Team.user_id == current_user.id).distinct()
+            )
+        ).all()
+    )
+    ordered_ids: list[UUID] = []
+    for lid in [*member_league_ids, *team_league_ids]:
+        if lid not in ordered_ids:
+            ordered_ids.append(lid)
+    if not ordered_ids:
+        return []
+    leagues = list((await session.scalars(select(League).where(League.id.in_(ordered_ids)))).all())
+    out: list[MyLeagueRead] = []
+    for league in leagues:
+        is_commish = league.commissioner_user_id == current_user.id
+        if not is_commish:
+            role = await session.scalar(
+                select(LeagueMember.role).where(
+                    LeagueMember.league_id == league.id,
+                    LeagueMember.user_id == current_user.id,
+                )
+            )
+            if role == LeagueRole.COMMISSIONER:
+                is_commish = True
+        out.append(
+            MyLeagueRead(
+                id=league.id,
+                name=league.name,
+                slug=league.slug,
+                draft_scheduled_at=league.draft_scheduled_at,
+                is_commissioner=is_commish,
+            )
+        )
+    return sorted(out, key=lambda league: league.name.lower())
+
+
 @app.post("/api/commissioner/leagues/quick-create", response_model=QuickCreateLeagueResponse)
 async def commissioner_quick_create_league(
     payload: QuickCreateLeagueRequest,
+    current_user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_async_session),
 ) -> QuickCreateLeagueResponse:
     league_name = payload.league_name.strip()
@@ -225,6 +352,8 @@ async def commissioner_quick_create_league(
         raise HTTPException(status_code=400, detail="league_name, league_slug, and commissioner_email are required")
     if len(team_names) < 2:
         raise HTTPException(status_code=400, detail="At least two teams are required")
+    if current_user.email.lower() != commissioner_email:
+        raise HTTPException(status_code=403, detail="commissioner_email must match the authenticated user")
 
     existing_league = await session.scalar(select(League).where(League.slug == league_slug))
     if existing_league is not None:
@@ -232,23 +361,32 @@ async def commissioner_quick_create_league(
 
     commissioner = await session.scalar(select(User).where(User.email == commissioner_email))
     if commissioner is None:
-        commissioner = User(
-            email=commissioner_email,
-            display_name="-".join(payload.commissioner_display_name.split(" ")).lower() if payload.commissioner_display_name else commissioner_email.split("@")[0],
-        )
-        session.add(commissioner)
-        await session.flush()
+        raise HTTPException(status_code=400, detail="Commissioner must be a registered user")
+
+    if payload.commissioner_display_name and payload.commissioner_display_name.strip():
+        commissioner.display_name = payload.commissioner_display_name.strip()
 
     league = League(name=league_name, slug=league_slug, commissioner_user_id=commissioner.id)
     session.add(league)
     await session.flush()
 
+    session.add(
+        LeagueMember(
+            league_id=league.id,
+            user_id=commissioner.id,
+            role=LeagueRole.COMMISSIONER,
+        )
+    )
+
     created_team_ids: list[UUID] = []
     for idx, team_name in enumerate(team_names, start=1):
         user_obj = await session.scalar(select(User).where(User.display_name == team_name))
         if user_obj is None:
-            raise HTTPException(status_code=404, detail=f"User for team {team_name} not found. Please create the user first.")
-            
+            raise HTTPException(
+                status_code=404,
+                detail=f"User for team {team_name} not found. Please create the user first.",
+            )
+
         team = Team(
             league_id=league.id,
             user_id=user_obj.id,
@@ -258,6 +396,14 @@ async def commissioner_quick_create_league(
         session.add(team)
         await session.flush()
         created_team_ids.append(team.id)
+        if user_obj.id != commissioner.id:
+            session.add(
+                LeagueMember(
+                    league_id=league.id,
+                    user_id=user_obj.id,
+                    role=LeagueRole.MEMBER,
+                )
+            )
 
     await session.commit()
     return QuickCreateLeagueResponse(
@@ -270,11 +416,14 @@ async def commissioner_quick_create_league(
 @app.get("/api/leagues/{league_id}/draft-session", response_model=DraftSessionResponse)
 async def get_draft_session(
     league_id: UUID,
+    current_user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_async_session),
 ) -> DraftSessionResponse:
     league = await session.get(League, league_id)
     if league is None:
         raise HTTPException(status_code=404, detail="League not found")
+    if not await user_has_league_access(session, current_user.id, league_id):
+        raise HTTPException(status_code=403, detail="You do not have access to this league")
 
     teams = list((await session.scalars(select(Team).where(Team.league_id == league_id))).all())
     players = list((await session.scalars(select(Player).order_by(Player.full_name))).all())
@@ -320,11 +469,14 @@ async def get_draft_session(
 async def update_draft_session(
     league_id: UUID,
     payload: DraftSessionUpdateRequest,
+    current_user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_async_session),
 ) -> DraftSessionResponse:
     league = await session.get(League, league_id)
     if league is None:
         raise HTTPException(status_code=404, detail="League not found")
+    if not await user_has_league_access(session, current_user.id, league_id):
+        raise HTTPException(status_code=403, detail="You do not have access to this league")
 
     for update in payload.team_updates:
         team = await session.get(Team, update.id)
@@ -381,8 +533,11 @@ async def update_draft_session(
 async def commissioner_approve_trade(
     league_id: UUID,
     trade_id: UUID,
+    current_user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_async_session),
 ) -> CommissionerTradeApprovalResponse:
+    if not await user_is_league_commissioner(session, current_user.id, league_id):
+        raise HTTPException(status_code=403, detail="Commissioner access required")
     trade = await session.get(Trade, trade_id)
     if trade is None or trade.league_id != league_id:
         raise HTTPException(status_code=404, detail="Trade not found")
@@ -402,11 +557,14 @@ async def commissioner_approve_trade(
 @app.get("/api/leagues/{league_id}/commissioner/export/draft-results.csv")
 async def commissioner_export_draft_results(
     league_id: UUID,
+    current_user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_async_session),
 ) -> Response:
     league = await session.get(League, league_id)
     if league is None:
         raise HTTPException(status_code=404, detail="League not found")
+    if not await user_is_league_commissioner(session, current_user.id, league_id):
+        raise HTTPException(status_code=403, detail="Commissioner access required")
 
     rows = (
         await session.execute(
@@ -446,9 +604,39 @@ async def commissioner_export_draft_results(
     )
 
 
+@app.put("/api/leagues/{league_id}/commissioner/schedule-draft", response_model=LeagueRead)
+async def commissioner_schedule_draft(
+    league_id: UUID,
+    payload: ScheduleDraftRequest,
+    current_user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_async_session),
+) -> LeagueRead:
+    if not await user_is_league_commissioner(session, current_user.id, league_id):
+        raise HTTPException(status_code=403, detail="Commissioner access required")
+    league = await session.get(League, league_id)
+    if league is None:
+        raise HTTPException(status_code=404, detail="League not found")
+
+    when = payload.draft_scheduled_at
+    if when.tzinfo is None:
+        raise HTTPException(
+            status_code=400,
+            detail="draft_scheduled_at must be timezone-aware (include offset or Z)",
+        )
+    now = datetime.now(timezone.utc)
+    if when.astimezone(timezone.utc) <= now:
+        raise HTTPException(status_code=400, detail="draft_scheduled_at must be in the future")
+
+    league.draft_scheduled_at = when.astimezone(timezone.utc)
+    await session.commit()
+    await session.refresh(league)
+    return LeagueRead.model_validate(league)
+
+
 @app.post("/api/players/bulk-upload-csv", response_model=BulkPlayerUploadResult)
 async def bulk_upload_players_csv(
     file: UploadFile = File(...),
+    _: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_async_session),
 ) -> BulkPlayerUploadResult:
     if not file.filename.lower().endswith(".csv"):
@@ -526,7 +714,23 @@ async def bulk_upload_players_csv(
 
 
 @app.websocket("/ws/draft/{league_id}")
-async def draft_room_socket(websocket: WebSocket, league_id: UUID) -> None:
+async def draft_room_socket(
+    websocket: WebSocket,
+    league_id: UUID,
+    token: str | None = Query(None),
+) -> None:
+    if not token:
+        await websocket.close(code=1008)
+        return
+    user_id = decode_access_token(token)
+    if user_id is None:
+        await websocket.close(code=1008)
+        return
+    async with async_session_factory() as session:
+        if not await user_has_league_access(session, user_id, league_id):
+            await websocket.close(code=1008)
+            return
+
     broker = app.state.ws_broker
     channel = draft_channel(league_id)
     await broker.connect(websocket, channel)
@@ -540,7 +744,23 @@ async def draft_room_socket(websocket: WebSocket, league_id: UUID) -> None:
 
 
 @app.websocket("/ws/trades/{league_id}")
-async def trade_feed_socket(websocket: WebSocket, league_id: UUID) -> None:
+async def trade_feed_socket(
+    websocket: WebSocket,
+    league_id: UUID,
+    token: str | None = Query(None),
+) -> None:
+    if not token:
+        await websocket.close(code=1008)
+        return
+    user_id = decode_access_token(token)
+    if user_id is None:
+        await websocket.close(code=1008)
+        return
+    async with async_session_factory() as session:
+        if not await user_has_league_access(session, user_id, league_id):
+            await websocket.close(code=1008)
+            return
+
     broker = app.state.ws_broker
     channel = trade_feed_channel(league_id)
     await broker.connect(websocket, channel)

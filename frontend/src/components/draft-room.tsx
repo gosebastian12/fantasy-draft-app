@@ -1,6 +1,7 @@
 "use client";
 
 import { ChangeEvent, useEffect, useMemo, useState } from "react";
+import Link from "next/link";
 import { clsx } from "clsx";
 
 type TabKey = "board" | "players" | "trades" | "commissioner";
@@ -34,7 +35,7 @@ type Team = {
 };
 
 type DraftSession = {
-  league: { id: string; name: string; slug: string };
+  league: { id: string; name: string; slug: string; draft_scheduled_at?: string | null };
   teams: Team[];
   players: Player[];
   trades: {
@@ -46,7 +47,7 @@ type DraftSession = {
   }[];
 };
 
-export function DraftRoomShell({ leagueId }: { leagueId: string }) {
+export function DraftRoomShell({ leagueId, accessToken }: { leagueId: string; accessToken: string }) {
   const [tab, setTab] = useState<TabKey>("board");
   const [picks, setPicks] = useState<DraftPick[]>([]);
   const [trades, setTrades] = useState<TradeFeedItem[]>([]);
@@ -61,15 +62,39 @@ export function DraftRoomShell({ leagueId }: { leagueId: string }) {
   const [commissionerDisplayName, setCommissionerDisplayName] = useState("");
   const [commissionerEmail, setCommissionerEmail] = useState("");
   const [teamNamesCsv, setTeamNamesCsv] = useState("");
+  const [leagueDraftAt, setLeagueDraftAt] = useState<string | null>(null);
+  const [isCommissioner, setIsCommissioner] = useState(false);
+  const [scheduleLocal, setScheduleLocal] = useState("");
+  const [scheduleMessage, setScheduleMessage] = useState("");
+  const [sessionError, setSessionError] = useState("");
 
   const apiBase = useMemo(() => {
     return process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
   }, []);
 
+  const authHeaders = useMemo(
+    () => ({
+      Authorization: `Bearer ${accessToken}`,
+    }),
+    [accessToken],
+  );
+
+  const authJsonHeaders = useMemo(
+    () => ({
+      ...authHeaders,
+      "Content-Type": "application/json",
+    }),
+    [authHeaders],
+  );
+
   const fetchSession = async () => {
     const res = await fetch(`${apiBase}/api/leagues/${leagueId}/draft-session`, {
       cache: "no-store",
+      headers: authHeaders,
     });
+    if (res.status === 403) {
+      throw new Error("forbidden");
+    }
     if (!res.ok) {
       throw new Error("Failed to fetch draft session");
     }
@@ -78,6 +103,7 @@ export function DraftRoomShell({ leagueId }: { leagueId: string }) {
     setTeams(data.teams);
     setAllTrades(data.trades);
     setLeagueName(data.league.name);
+    setLeagueDraftAt(data.league.draft_scheduled_at ?? null);
   };
 
   const wsDraftUrl = useMemo(() => {
@@ -86,8 +112,9 @@ export function DraftRoomShell({ leagueId }: { leagueId: string }) {
         ? "wss"
         : "ws";
     const u = new URL(apiBase);
-    return `${proto}://${u.host}/ws/draft/${leagueId}`;
-  }, [apiBase, leagueId]);
+    const qs = new URLSearchParams({ token: accessToken });
+    return `${proto}://${u.host}/ws/draft/${leagueId}?${qs.toString()}`;
+  }, [apiBase, leagueId, accessToken]);
 
   const wsTradesUrl = useMemo(() => {
     const proto =
@@ -95,14 +122,34 @@ export function DraftRoomShell({ leagueId }: { leagueId: string }) {
         ? "wss"
         : "ws";
     const u = new URL(apiBase);
-    return `${proto}://${u.host}/ws/trades/${leagueId}`;
-  }, [apiBase, leagueId]);
+    const qs = new URLSearchParams({ token: accessToken });
+    return `${proto}://${u.host}/ws/trades/${leagueId}?${qs.toString()}`;
+  }, [apiBase, leagueId, accessToken]);
 
   useEffect(() => {
-    fetchSession().catch(() => {
-      setUploadMessage("Could not load draft session data.");
+    setSessionError("");
+    fetchSession().catch((err: unknown) => {
+      if (err instanceof Error && err.message === "forbidden") {
+        setSessionError("You do not have access to this league.");
+      } else {
+        setSessionError("Could not load draft session data.");
+      }
     });
-  }, [apiBase, leagueId]);
+  }, [apiBase, leagueId, authHeaders]);
+
+  useEffect(() => {
+    const run = async () => {
+      const res = await fetch(`${apiBase}/api/me/leagues`, {
+        headers: authHeaders,
+        cache: "no-store",
+      });
+      if (!res.ok) return;
+      const rows = (await res.json()) as { id: string; is_commissioner: boolean }[];
+      const row = rows.find((r) => r.id === leagueId);
+      setIsCommissioner(Boolean(row?.is_commissioner));
+    };
+    void run();
+  }, [apiBase, leagueId, authHeaders]);
 
   useEffect(() => {
     const d = new WebSocket(wsDraftUrl);
@@ -161,6 +208,7 @@ export function DraftRoomShell({ leagueId }: { leagueId: string }) {
 
     const res = await fetch(`${apiBase}/api/players/bulk-upload-csv`, {
       method: "POST",
+      headers: authHeaders,
       body: formData,
     });
     if (!res.ok) {
@@ -188,7 +236,7 @@ export function DraftRoomShell({ leagueId }: { leagueId: string }) {
     };
     const res = await fetch(`${apiBase}/api/leagues/${leagueId}/draft-session`, {
       method: "PUT",
-      headers: { "Content-Type": "application/json" },
+      headers: authJsonHeaders,
       body: JSON.stringify(payload),
     });
     setSessionMessage(
@@ -199,7 +247,7 @@ export function DraftRoomShell({ leagueId }: { leagueId: string }) {
   const approveTrade = async (tradeId: string) => {
     const res = await fetch(
       `${apiBase}/api/leagues/${leagueId}/commissioner/trades/${tradeId}/approve`,
-      { method: "PUT" },
+      { method: "PUT", headers: authHeaders },
     );
     if (!res.ok) {
       setCommissionerMessage("Could not approve trade.");
@@ -216,7 +264,7 @@ export function DraftRoomShell({ leagueId }: { leagueId: string }) {
       .filter(Boolean);
     const res = await fetch(`${apiBase}/api/commissioner/leagues/quick-create`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: authJsonHeaders,
       body: JSON.stringify({
         league_name: newLeagueName,
         commissioner_display_name: commissionerDisplayName,
@@ -234,9 +282,48 @@ export function DraftRoomShell({ leagueId }: { leagueId: string }) {
     );
   };
 
-  const exportDraftResults = () => {
-    const url = `${apiBase}/api/leagues/${leagueId}/commissioner/export/draft-results.csv`;
-    window.open(url, "_blank");
+  const exportDraftResults = async () => {
+    const res = await fetch(
+      `${apiBase}/api/leagues/${leagueId}/commissioner/export/draft-results.csv`,
+      { headers: authHeaders },
+    );
+    if (!res.ok) {
+      setCommissionerMessage("Export failed (commissioner access required).");
+      return;
+    }
+    const blob = await res.blob();
+    const href = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = href;
+    a.download = `${leagueName.replace(/\s+/g, "-").toLowerCase()}-draft-results.csv`;
+    a.click();
+    URL.revokeObjectURL(href);
+    setCommissionerMessage("Draft results downloaded.");
+  };
+
+  const scheduleDraft = async () => {
+    setScheduleMessage("");
+    if (!scheduleLocal) {
+      setScheduleMessage("Pick a date and time first.");
+      return;
+    }
+    const res = await fetch(`${apiBase}/api/leagues/${leagueId}/commissioner/schedule-draft`, {
+      method: "PUT",
+      headers: authJsonHeaders,
+      body: JSON.stringify({
+        draft_scheduled_at: new Date(scheduleLocal).toISOString(),
+      }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      const detail = (err as { detail?: string }).detail;
+      setScheduleMessage(typeof detail === "string" ? detail : "Could not schedule draft.");
+      return;
+    }
+    const league = (await res.json()) as { draft_scheduled_at: string | null };
+    setLeagueDraftAt(league.draft_scheduled_at);
+    setScheduleMessage("Draft time saved.");
+    await fetchSession();
   };
 
   const tabButton = (key: TabKey, label: string) => (
@@ -259,10 +346,20 @@ export function DraftRoomShell({ leagueId }: { leagueId: string }) {
       <header className="border-b border-slate-800/80 px-4 py-4">
         <div className="flex items-center justify-between gap-3">
           <div>
+            <Link href="/" className="mb-1 inline-block text-xs text-sky-400 hover:text-sky-300">
+              ← Your leagues
+            </Link>
             <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">League draft</p>
             <h1 className="text-lg font-semibold text-white">{leagueName}</h1>
           </div>
-          <p className="text-xs text-slate-400">{teams.length} teams</p>
+          <div className="text-right text-xs text-slate-400">
+            <p>{teams.length} teams</p>
+            {leagueDraftAt ? (
+              <p className="mt-1 text-sky-300">Draft: {new Date(leagueDraftAt).toLocaleString()}</p>
+            ) : (
+              <p className="mt-1 text-slate-500">No draft scheduled</p>
+            )}
+          </div>
         </div>
       </header>
 
@@ -278,6 +375,11 @@ export function DraftRoomShell({ leagueId }: { leagueId: string }) {
       </div>
 
       <main className="flex flex-1 flex-col gap-4 px-4 py-4">
+        {sessionError ? (
+          <p className="rounded-lg border border-rose-900/60 bg-rose-950/40 px-3 py-2 text-sm text-rose-200">
+            {sessionError}
+          </p>
+        ) : null}
         {tab === "board" ? (
           <section className="rounded-xl border border-slate-800 bg-slate-900/40 p-4">
             <h2 className="mb-3 text-sm font-semibold text-slate-200">Draft board</h2>
@@ -440,6 +542,32 @@ export function DraftRoomShell({ leagueId }: { leagueId: string }) {
               </button>
             </div>
 
+            {isCommissioner ? (
+              <div className="mb-4 rounded-lg border border-slate-800 bg-slate-950/50 p-3">
+                <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">
+                  Schedule draft (future)
+                </p>
+                <p className="mb-2 text-xs text-slate-500">
+                  Sets the league&apos;s draft time in the database. Must be in the future (local time is converted to
+                  UTC automatically).
+                </p>
+                <input
+                  type="datetime-local"
+                  value={scheduleLocal}
+                  onChange={(e) => setScheduleLocal(e.target.value)}
+                  className="w-full max-w-xs rounded-md border border-slate-700 bg-slate-900 px-2 py-2 text-sm text-slate-100"
+                />
+                <button
+                  type="button"
+                  onClick={() => void scheduleDraft()}
+                  className="ml-0 mt-3 block rounded-md bg-amber-700 px-3 py-2 text-xs font-semibold text-white hover:bg-amber-600 md:ml-3 md:mt-0 md:inline-block"
+                >
+                  Save draft schedule
+                </button>
+                {scheduleMessage ? <p className="mt-2 text-xs text-slate-400">{scheduleMessage}</p> : null}
+              </div>
+            ) : null}
+
             <div className="mb-4 rounded-lg border border-slate-800 bg-slate-950/50 p-3">
               <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">
                 Trade approvals
@@ -475,7 +603,7 @@ export function DraftRoomShell({ leagueId }: { leagueId: string }) {
               </p>
               <button
                 type="button"
-                onClick={exportDraftResults}
+                onClick={() => void exportDraftResults()}
                 className="rounded-md bg-violet-700 px-3 py-2 text-xs font-semibold text-white hover:bg-violet-600"
               >
                 Export draft results CSV

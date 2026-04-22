@@ -26,6 +26,10 @@ class League(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now().astimezone()
     )
+    draft_scheduled_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
 
     commissioner = relationship("User", foreign_keys=[commissioner_user_id])
     members = relationship("LeagueMember", back_populates="league", cascade="all, delete-orphan")

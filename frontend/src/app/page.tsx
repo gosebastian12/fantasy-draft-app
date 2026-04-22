@@ -1,5 +1,5 @@
-import { DraftRoomShell } from "@/components/draft-room";
+import { AppHome } from "@/components/app-home";
 
 export default function Home() {
-  return <DraftRoomShell leagueId="00000000-0000-0000-0000-000000000001" />;
+  return <AppHome />;
 }
