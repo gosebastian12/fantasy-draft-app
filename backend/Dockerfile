@@ -16,8 +16,10 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
 COPY pyproject.toml uv.lock ./
 COPY app ./app
+COPY alembic ./alembic
 
 RUN uv sync --frozen --no-dev
+RUN uv run alembic upgrade head
 
 EXPOSE 8000
 

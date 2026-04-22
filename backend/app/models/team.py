@@ -17,7 +17,7 @@ class Team(Base):
     __tablename__ = "teams"
     __table_args__ = (UniqueConstraint("league_id", "user_id", name="uq_team_league_owner"),)
 
-    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    id: Mapped[str] = mapped_column(primary_key=True, default=lambda: str(uuid.uuid4()))
     league_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("leagues.id", ondelete="CASCADE"),
         index=True,

@@ -62,7 +62,7 @@ class Trade(Base):
 
 
 class TradeParticipant(Base):
-    """Exactly 2–3 rows per trade (enforced in app / DB migration)."""
+    """Exactly 2-3 rows per trade (enforced in app / DB migration)."""
 
     __tablename__ = "trade_participants"
     __table_args__ = (
