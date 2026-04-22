@@ -27,6 +27,14 @@ class Settings(BaseSettings):
     # Redis key prefix for OTP codes
     otp_key_prefix: str = "otp:"
 
+    # When both are non-empty, upsert this user on API startup (local/dev only).
+    # Example: DEV_SUPERUSER_EMAIL=superuser@fantasy-draft.local
+    #          DEV_SUPERUSER_PASSWORD=your-secret-here
+    # Log in with that email, then quick-create with the same commissioner_email.
+    dev_superuser_email: str = ""
+    dev_superuser_password: str = ""
+    dev_superuser_display_name: str = "Commissioner"
+
 
 @lru_cache
 def get_settings() -> Settings:

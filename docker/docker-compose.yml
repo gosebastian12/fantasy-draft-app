@@ -33,6 +33,10 @@ services:
       DATABASE_URL: postgresql+asyncpg://draft:draft@postgres:5432/fantasy_draft
       REDIS_URL: redis://redis:6379/0
       JWT_SECRET: ${JWT_SECRET:-change-me-in-production-min-16-chars}
+      # Optional: seed/update a dev login on every backend start (same values you use in the UI).
+      # DEV_SUPERUSER_EMAIL: superuser@fantasy-draft.local
+      # DEV_SUPERUSER_PASSWORD: LocalDev-Superuser-2026!
+      # DEV_SUPERUSER_DISPLAY_NAME: Commissioner
     depends_on:
       postgres:
         condition: service_healthy

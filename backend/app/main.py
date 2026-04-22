@@ -20,6 +20,7 @@ from sqlalchemy.orm import selectinload
 
 import app.models  # noqa: F401  # register SQLAlchemy mappers for Alembic / metadata
 
+from app.bootstrap.dev_superuser import ensure_dev_superuser
 from app.core.config import get_settings
 from app.core.security import create_access_token, decode_access_token, hash_password, verify_password
 from app.db.session import async_session_factory, get_async_session
@@ -48,6 +49,7 @@ async def lifespan(app: FastAPI):
     broker = get_broker(_settings.redis_url)
     await broker.start()
     app.state.ws_broker = broker
+    await ensure_dev_superuser(_settings)
     yield
     await broker.shutdown()
     ws_manager._broker = None
