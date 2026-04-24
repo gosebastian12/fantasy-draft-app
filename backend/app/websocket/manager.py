@@ -135,11 +135,65 @@ class DraftRealtimeBroker:
             raise
 
 
+class MemoryRealtimeBroker:
+    """
+    Single-process WebSocket fan-out without Redis.
+
+    ``publish`` delivers only to sockets connected to this process (no cross-replica fan-out).
+    Use when Redis is not running (local dev).
+    """
+
+    def __init__(self) -> None:
+        self._channel_clients: dict[str, set[WebSocket]] = defaultdict(set)
+        self._lock = asyncio.Lock()
+        self._closing = asyncio.Event()
+
+    async def start(self) -> None:
+        self._closing.clear()
+        logger.info("In-memory WebSocket broker started (no Redis).")
+
+    async def shutdown(self) -> None:
+        self._closing.set()
+        async with self._lock:
+            self._channel_clients.clear()
+
+    async def connect(self, websocket: WebSocket, channel: str) -> None:
+        await websocket.accept()
+        async with self._lock:
+            self._channel_clients[channel].add(websocket)
+
+    async def disconnect(self, websocket: WebSocket, channel: str) -> None:
+        async with self._lock:
+            clients = self._channel_clients.get(channel)
+            if not clients:
+                return
+            clients.discard(websocket)
+            if not clients:
+                self._channel_clients.pop(channel, None)
+
+    async def publish(self, channel: str, payload: dict[str, Any]) -> None:
+        await self.broadcast_local(channel, payload)
+
+    async def broadcast_local(self, channel: str, payload: dict[str, Any]) -> None:
+        message = json.dumps(payload, default=str)
+        async with self._lock:
+            clients = list(self._channel_clients.get(channel, ()))
+        stale: list[WebSocket] = []
+        for ws in clients:
+            try:
+                await ws.send_text(message)
+            except Exception:  # pragma: no cover
+                logger.exception("Failed to deliver websocket payload; dropping client")
+                stale.append(ws)
+        for ws in stale:
+            await self.disconnect(ws, channel)
+
+
 # Lazy module singleton so tests can substitute the broker
-_broker: Optional[DraftRealtimeBroker] = None
+_broker: Optional[DraftRealtimeBroker | MemoryRealtimeBroker] = None
 
 
-def get_broker(redis_url: Optional[str] = None) -> DraftRealtimeBroker:
+def get_broker(redis_url: Optional[str] = None) -> DraftRealtimeBroker | MemoryRealtimeBroker:
     global _broker
     if _broker is None:
         if redis_url is None:

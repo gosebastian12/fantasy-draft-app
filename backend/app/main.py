@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import csv
 import io
 import logging
@@ -34,7 +35,12 @@ from app.models.team import Team
 from app.models.trade import Trade
 from app.models.user import User
 from app.services.league_access import user_has_league_access, user_is_league_commissioner
-from app.websocket.manager import draft_channel, get_broker, trade_feed_channel
+from app.websocket.manager import (
+    DraftRealtimeBroker,
+    MemoryRealtimeBroker,
+    draft_channel,
+    trade_feed_channel,
+)
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -46,9 +52,26 @@ _settings = get_settings()
 async def lifespan(app: FastAPI):
     import app.websocket.manager as ws_manager
 
-    broker = get_broker(_settings.redis_url)
-    await broker.start()
+    redis_broker = DraftRealtimeBroker(_settings.redis_url)
+    broker: DraftRealtimeBroker | MemoryRealtimeBroker
+    try:
+        await asyncio.wait_for(redis_broker.start(), timeout=5.0)
+        broker = redis_broker
+    except Exception as exc:
+        logger.warning(
+            "Redis unavailable (%s); using in-memory WebSocket broker (single process, no cross-instance fan-out). "
+            "Start Redis (e.g. `docker compose -f docker/docker-compose.yml up -d redis`) for full realtime.",
+            exc,
+        )
+        try:
+            await redis_broker.shutdown()
+        except Exception:
+            logger.debug("Redis broker shutdown after failed start", exc_info=True)
+        broker = MemoryRealtimeBroker()
+        await broker.start()
+
     app.state.ws_broker = broker
+    ws_manager._broker = broker
     await ensure_dev_seed(_settings)
     yield
     await broker.shutdown()
